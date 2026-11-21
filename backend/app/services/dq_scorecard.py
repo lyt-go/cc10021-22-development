@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
+from app.services import observation
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -62,6 +63,7 @@ class DqScorecardService(BaseModuleService):
         # 写入评分卡记录
         rows = store.rows(self.MODULE)
         new_id = max((int(r.get("id", 0)) for r in rows), default=0) + 1
+        scored_at = datetime.now(timezone.utc)
         entry = {
             "id": new_id,
             "记录编号": f"DQ_S-{new_id:04d}",
@@ -70,8 +72,9 @@ class DqScorecardService(BaseModuleService):
             "准确性得分": str(round(accuracy, 1)),
             "时效性得分": str(round(timeliness, 1)),
             "综合得分": str(round(overall, 1)),
-            "评分时间": datetime.now(timezone.utc).isoformat(),
+            "评分时间": scored_at.isoformat(),
             "评分版本": "v1.0",
+            "数据版本": "v1.0",
             "status": "已完成",
             "pending": False,
             "abnormal": overall < 60,
@@ -79,7 +82,8 @@ class DqScorecardService(BaseModuleService):
         rows.append(entry)
 
         # 聚合评分结果写入趋势记录
-        self._write_trend_record(table_name, completeness, accuracy, timeliness, overall)
+        self._write_trend_record(table_name, completeness, accuracy, timeliness, overall,
+                                 scored_at=scored_at, version="v1.0")
 
         return {
             "目标表名": table_name,
@@ -95,24 +99,91 @@ class DqScorecardService(BaseModuleService):
         }
 
     def _write_trend_record(self, table_name: str, completeness: float, accuracy: float,
-                            timeliness: float, overall: float) -> None:
-        """聚合评分数据写入质量趋势记录。"""
+                            timeliness: float, overall: float,
+                            *, scored_at: datetime | None = None, version: str = "v1.0") -> None:
+        """聚合评分数据写入质量趋势记录。
+
+        评分卡和趋势记录用同一时间、同一版本落库，后续按 (表, 日期, 版本) 回查时
+        两边对得上，不会出现评分卡取到 v1、趋势取到 v2 的分母错位。
+        """
         trend_rows = store.rows("dq_trend")
         new_tid = max((int(r.get("id", 0)) for r in trend_rows), default=0) + 1
+        moment = scored_at or datetime.now(timezone.utc)
         trend_rows.append({
             "id": new_tid,
             "记录编号": f"DQ_T-{new_tid:04d}",
             "目标表名": table_name,
-            "日期": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "日期": moment.strftime("%Y-%m-%d"),
             "完备率": f"{completeness:.1f}%",
             "准确率": f"{accuracy:.1f}%",
             "及时率": f"{timeliness:.1f}%",
             "综合质量": f"{overall:.1f}",
             "趋势标记": "正常" if overall >= 75 else "下降趋势",
+            "评分版本": version,
+            "数据版本": version,
+            "采集时间": moment.isoformat(),
             "status": "正常" if overall >= 75 else "下降趋势",
             "pending": False,
             "abnormal": overall < 60,
         })
+
+    def filter_trend_observations(
+        self,
+        table_names: Sequence[str],
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        version: str | None = None,
+        observation_dates: Sequence[str] | None = None,
+        use_scorecard: bool = False,
+        resume_comparison_id: str | None = None,
+    ) -> dict[str, Any]:
+        """按观测集合过滤缺测样本，整理实际采用的时间和范围，供评分卡排名复核。
+
+        默认以质量趋势记录为观测来源；``use_scorecard=True`` 时直接以评分卡记录为准。
+        缺测日期不按 0 分计入，同一 (表, 日期) 只采用一条记录，其余保留候选回查。
+        """
+        if resume_comparison_id:
+            snapshot = observation.load_comparison(store, resume_comparison_id)
+            if snapshot is None:
+                raise ValueError(f"对比快照 {resume_comparison_id} 不存在，无法按原版本续取")
+            pinned = observation.pinned_versions_from(snapshot)
+            start_date = start_date or snapshot.get("起始日期")
+            end_date = end_date or snapshot.get("结束日期")
+        else:
+            pinned = None
+
+        source = "dq_scorecard" if use_scorecard else "dq_trend"
+        rows = store.rows(source)
+        result = observation.build_observation_comparison(
+            rows,
+            table_names,
+            start_date=start_date,
+            end_date=end_date,
+            version=version,
+            observation_dates=observation_dates,
+            pinned_versions=pinned,
+            version_keys=("数据版本", "评分版本", "版本"),
+            score_keys=("综合得分", "综合质量", "评分") if use_scorecard
+            else ("综合质量", "综合得分", "评分"),
+            time_keys=("评分时间", "采集时间", "更新时间") if use_scorecard
+            else ("采集时间", "评分时间", "更新时间"),
+            score_label="综合得分" if use_scorecard else "综合质量",
+        )
+        result["观测来源"] = source
+        result["观测来源名称"] = "质量评分卡" if use_scorecard else "质量趋势"
+        result["续取来源"] = resume_comparison_id
+        result["是否续取"] = resume_comparison_id is not None
+        result["同步复核清单"] = False
+
+        if resume_comparison_id:
+            observation.sync_ranking_review(store, result, resume_comparison_id)
+            result["同步复核清单"] = True
+        return result
+
+    def ranking_review_list(self) -> list[dict[str, Any]]:
+        """评分卡排名复核清单：趋势查询同步过来的结论，含日期、缺数表和名次。"""
+        return observation.list_ranking_review(store)
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()

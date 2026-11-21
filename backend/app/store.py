@@ -14,6 +14,9 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 非业务模块的共享状态：对比快照、排名复核清单等。
+        # 不放进 _tables，避免出现在运营概览和资源列表里。
+        self.state: dict[str, Any] = {}
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)

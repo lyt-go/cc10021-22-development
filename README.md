@@ -79,3 +79,35 @@ npm run dev
 
 领域：数据工程
 子方向：数仓与数据湖
+
+## 质量趋势观测集合
+
+质量趋势看板和评分卡共用 `backend/app/services/observation.py` 的观测口径：
+
+- 只有对比组**所有表都有评分**的日期才进入共同观测集，`分母` 就是这些日期的数量；
+  缺测日期不按 0 分参与平均，避免把缺数表误压成“整改第一名”。
+- 同一 (表, 日期) 有多条评分时只采用一条：优先最高版本，其次最晚采集时间；
+  全部候选保留在 `候选记录` 里，`版本回查` 给出采用记录与候选版本的对照。
+- `resume_comparison_id` 用于中断后重取：每个单元格固定回上一轮实际采用的版本，
+  该版本缺失时标为“版本缺失”，不会悄悄换成新版本，保证分母和评分同源。
+- 趋势查询默认把结论同步到评分卡排名复核清单（`/api/dq_scorecard/ranking-review`），
+  清单里带进入比较的日期、缺数表、待补录日期、名次和“何时可用于复核”。
+
+示例对比组：`dwd_trade_detail` 在 2026-11-10~12 三天有分，`ods_order_info` 缺 11-11
+且 11-12 有 v1/v2 两个版本。启动后可查：
+
+```bash
+# 趋势对比（preview=true 只查不落快照）
+curl "http://127.0.0.1:8000/api/dq_trend/comparison?tables=dwd_trade_detail,ods_order_info&start_date=2026-11-10&end_date=2026-11-12&preview=true"
+# 落快照并同步评分卡排名复核清单
+curl -X POST http://127.0.0.1:8000/api/dq_trend/comparison \
+  -H 'Content-Type: application/json' \
+  -d '{"tables":["dwd_trade_detail","ods_order_info"],"start_date":"2026-11-10","end_date":"2026-11-12"}'
+# 按上一轮采用的记录与版本续取
+curl "http://127.0.0.1:8000/api/dq_trend/comparison?tables=dwd_trade_detail,ods_order_info&resume_comparison_id=CMP-0001&preview=true"
+# 评分卡侧过滤缺测样本 + 复核清单
+curl "http://127.0.0.1:8000/api/dq_scorecard/observations?tables=dwd_trade_detail,ods_order_info&start_date=2026-11-10&end_date=2026-11-12"
+curl "http://127.0.0.1:8000/api/dq_scorecard/ranking-review"
+```
+
+前端在质量趋势看板、质量评分卡两个页面底部展示同一套查询面板；评分卡页额外展示排名复核清单。

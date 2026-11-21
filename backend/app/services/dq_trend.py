@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timezone, timedelta
-from typing import Any
+from typing import Any, Sequence
 
+from app.services import observation
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -20,7 +21,7 @@ class DqTrendService(BaseModuleService):
     MODULE = "dq_trend"
     ENTITY = "趋势记录"
     OPERATION_TERM = "计算"
-    LIST_FIELDS = ["记录编号", "目标表名", "日期", "完备率", "准确率", "及时率", "综合质量", "趋势标记"]
+    LIST_FIELDS = ["记录编号", "目标表名", "日期", "完备率", "准确率", "及时率", "综合质量", "趋势标记", "数据版本"]
     REQUIRED_FIELDS = ["记录编号", "目标表名", "日期"]
     STATUS_ORDER = ["正常", "下降趋势", "需关注", "已改善"]
     ACTION_RULES = {"标记下降": "下降趋势", "标记需关注": "需关注", "标记已改善": "已改善"}
@@ -88,6 +89,8 @@ class DqTrendService(BaseModuleService):
                 "及时率": dp["及时率"],
                 "综合质量": dp["综合质量"],
                 "趋势标记": trend_direction,
+                "数据版本": "v1.0",
+                "采集时间": datetime.now(timezone.utc).isoformat(),
                 "status": status,
                 "pending": status == "需关注",
                 "abnormal": status == "需关注",
@@ -165,6 +168,67 @@ class DqTrendService(BaseModuleService):
             "最佳表": ranked[0][0] if ranked else "N/A",
             "最差表": ranked[-1][0] if ranked else "N/A",
         }
+
+    def query_trend_comparison(
+        self,
+        table_names: Sequence[str],
+        *,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        version: str | None = None,
+        observation_dates: Sequence[str] | None = None,
+        resume_comparison_id: str | None = None,
+        sync_review: bool = True,
+        persist: bool = True,
+    ) -> dict[str, Any]:
+        """按共同观测日筛选并聚合质量趋势，产出本次对比实际采用的观测集合。
+
+        值日排整改顺序时要的是同口径名次：缺测的那天不能按 0 分拉低平均，
+        同一张表同一天有多个版本时只采用一条并保留候选回查。``resume_comparison_id``
+        用于中断后重取，把每个单元格固定回上一轮采用的版本，保证分母和评分同源。
+        """
+        comparison_id = observation.next_comparison_id(store) if persist else "PREVIEW"
+        pinned: dict[tuple[str, str], str] | None = None
+        resumed_from: str | None = None
+
+        if resume_comparison_id:
+            snapshot = observation.load_comparison(store, resume_comparison_id)
+            if snapshot is None:
+                raise ValueError(f"对比快照 {resume_comparison_id} 不存在，无法按原版本续取")
+            pinned = observation.pinned_versions_from(snapshot)
+            resumed_from = resume_comparison_id
+            start_date = start_date or snapshot.get("起始日期")
+            end_date = end_date or snapshot.get("结束日期")
+        elif persist:
+            latest = observation.latest_comparison_id(store, table_names, self.MODULE)
+            if latest:
+                resumed_from = latest
+
+        result = observation.build_observation_comparison(
+            store.rows(self.MODULE),
+            table_names,
+            start_date=start_date,
+            end_date=end_date,
+            version=version,
+            observation_dates=observation_dates,
+            pinned_versions=pinned,
+        )
+        result["对比编号"] = comparison_id
+        result["续取来源"] = resumed_from
+        result["是否续取"] = resumed_from is not None
+        result["同步复核清单"] = False
+
+        if persist:
+            observation.save_comparison(store, result, comparison_id=comparison_id,
+                                        source=self.MODULE)
+            if sync_review:
+                observation.sync_ranking_review(store, result, comparison_id)
+                result["同步复核清单"] = True
+        return result
+
+    def list_ranking_review(self) -> list[dict[str, Any]]:
+        """评分卡排名复核清单：按时间倒序列出已同步的对比结论。"""
+        return observation.list_ranking_review(store)
 
     def domain_snapshot(self) -> dict[str, Any]:
         snapshot = super().domain_snapshot()
